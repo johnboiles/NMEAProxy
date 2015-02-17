@@ -100,7 +100,7 @@ class NMEATCPServer(NMEAHandler):
                         for line in lines:
                             for handler in handlers:
                                 if handler != server:
-                                    handler.queue.put(data)
+                                    handler.queue.put(line)
                     except socket.error, error:
                         err = error.args[0]
                         if err == errno.EAGAIN or err == errno.EWOULDBLOCK:
