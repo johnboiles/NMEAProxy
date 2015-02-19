@@ -3,13 +3,12 @@ import argparse
 import logging
 import socket
 import threading
-import SocketServer
 import sys
 import time
 import signal
 import Queue
 import serial
-import errno
+import select
 
 handler_threads = []
 handlers = []
@@ -31,32 +30,56 @@ class StoppableThread(threading.Thread):
 
 
 class NMEAHandler(object):
+    """Abstract superclass for devices that exchange NMEA data"""
     def __init__(self):
         self.queue = Queue.Queue()
         self.running = True
+        self.connected = False
+        self.nmea_buffer = ''
+        self.message_rx_count = 0
+        self.message_tx_count = 0
 
     def send(self, data):
+        """Subclasses should override this to transmit data"""
         pass
 
     def receive(self):
-        yield None
+        """Subclasses should override this to receive data"""
+        pass
 
     def close(self):
+        """Subclasses should override this to perform shutdown-related tasks"""
         pass
+
+    def put_queue_data(self, data):
+        if self.running and self.connected:
+            self.queue.put(data)
 
     def stop(self):
         self.running = False
         self.close()
+        # TODO: Empty the queue
 
     def handle(self):
-        for data in self.receive():
-            if data:
+        # Receive data
+        data = self.receive()
+        if data:
+            lines = (self.nmea_buffer + data).split('\r')
+            self.nmea_buffer = lines.pop()
+            # TODO: Checksum?
+            for nmea_message in lines:
+                nmea_message = nmea_message.strip()
+                logging.debug("%s received message: %s" % (self, nmea_message))
+                self.message_rx_count += 1
                 for handler in handlers:
                     if handler != self:
-                        handler.queue.put(data)
+                        handler.put_queue_data(nmea_message)
+
+        # Transmit data
         while not self.queue.empty():
             data = self.queue.get()
-            logging.debug("%s will send data: %s" % (self.__class__, data))
+            logging.debug("%s will transmit message: %s" % (self, data))
+            self.message_tx_count += 1
             self.send(data + '\r\n')
 
         time.sleep(0.01)
@@ -67,62 +90,83 @@ class NMEAHandler(object):
 
 
 class NMEASerialDevice(NMEAHandler):
+    """Opens a serial port with the specified path and baud for receiving NMEA Messages"""
     def __init__(self, device_path, baud_rate):
         super(NMEASerialDevice, self).__init__()
         self.device = serial.Serial(device_path, baud_rate, timeout=0)
+        self.connected = True
 
     def send(self, data):
         self.device.write(data)
 
     def receive(self):
-        yield self.device.readline()
+        return self.device.read(1024)
 
     def close(self):
         self.device.close()
 
+    def __str__(self):
+        return '%s (%s)' % (self.__class__.__name__, self.device.portstr)
+
 
 class NMEATCPServer(NMEAHandler):
+    """Opens a TCP socket on the specified port for receiving NMEA Messages"""
     def __init__(self, port):
         super(NMEATCPServer, self).__init__()
 
-        # TODO: This is kinda ugly, but works
-        server = self
-        class RequestHandler(SocketServer.StreamRequestHandler):
-            nmea_buffer = ''
-            timeout = 0
+        self.port = port
 
-            def handle(self):
-                while 1:
-                    try:
-                        data = self.request.recv(1024)
-                        lines = (self.nmea_buffer + data).split('\r')
-                        self.nmea_buffer = lines.pop()
-                        for line in lines:
-                            for handler in handlers:
-                                if handler != server:
-                                    handler.queue.put(line)
-                    except socket.error, error:
-                        err = error.args[0]
-                        if err == errno.EAGAIN or err == errno.EWOULDBLOCK:
-                            pass
-                        else:
-                            # a "real" error occurred
-                            print error
-                            sys.exit(1)
+        backlog = 5
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(('0.0.0.0', port))
+        self.socket.setblocking(0)
+        self.socket.settimeout(0)
+        self.socket.listen(backlog)
 
-                    while not server.queue.empty():
-                        data = server.queue.get()
-                        self.wfile.write(data + '\r\n')
+        self.client = None
+        self.address = None
 
-                    time.sleep(0.01)
+    def send(self, data):
+        ready = select.select([], [self.client], [], 0)
+        if ready[1]:
+            self.client.send(data)
+            return True
+        else:
+            return False
 
-        self.server = SocketServer.TCPServer(('0.0.0.0', port), RequestHandler)
+    def receive(self):
+        ready = select.select([self.client], [], [], 0)
+        if ready[0]:
+            return self.client.recv(1024)
+
+    def close(self):
+        if self.client:
+            self.client.close()
 
     def loop(self):
-        self.server.serve_forever()
+        while self.running:
+            try:
+                self.client, self.address = self.socket.accept()
+                self.connected = True
+                logging.info('Client connected: %s' % self.address[0])
+                super(NMEATCPServer, self).loop()
+            except socket.error:
+                if self.connected:
+                    logging.info('Client %s disconnected' % self.address[0])
+                    self.connected = False
+                    self.client = None
+                    self.address = None
+                else:
+                    logging.debug('Waiting for connection on port %s' % self.port)
+                    time.sleep(1)
 
-    def stop(self):
-        self.server.shutdown()
+    def __str__(self):
+        if self.connected:
+            status_string = '%s:%s' % (self.address[0], self.port)
+        else:
+            status_string = 'waiting:%s' % self.port
+        return '%s (%s:%s)' % (self.__class__.__name__, status_string, self.port)
 
 
 def main_loop():
@@ -140,7 +184,13 @@ def thread_cleanup(signal, frame):
     sys.exit(0)
 
 
+def show_stats(signal, frame):
+    for handler in handlers:
+        logging.info("%s TX: %d RX: %d" % (handler, handler.message_tx_count, handler.message_rx_count))
+
+
 signal.signal(signal.SIGINT, thread_cleanup)
+signal.signal(signal.SIGUSR1, show_stats)
 
 
 if __name__ == '__main__':
