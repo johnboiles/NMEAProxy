@@ -58,6 +58,7 @@ class NMEAHandler(object):
     def stop(self):
         self.running = False
         self.close()
+        handlers.remove(self)
         # TODO: Empty the queue
 
     def handle(self):
@@ -109,23 +110,14 @@ class NMEASerialDevice(NMEAHandler):
         return '%s (%s)' % (self.__class__.__name__, self.device.portstr)
 
 
-class NMEATCPServer(NMEAHandler):
+class NMEATCPConnection(NMEAHandler):
     """Opens a TCP socket on the specified port for receiving NMEA Messages"""
-    def __init__(self, port):
-        super(NMEATCPServer, self).__init__()
+    def __init__(self, client, address):
+        super(NMEATCPConnection, self).__init__()
 
-        self.port = port
-
-        backlog = 5
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.bind(('0.0.0.0', port))
-        self.socket.setblocking(0)
-        self.socket.settimeout(0)
-        self.socket.listen(backlog)
-
-        self.client = None
-        self.address = None
+        self.connected = True
+        self.client = client
+        self.address = address
 
     def send(self, data):
         ready = select.select([], [self.client], [], 0)
@@ -147,31 +139,45 @@ class NMEATCPServer(NMEAHandler):
     def loop(self):
         while self.running:
             try:
-                self.client, self.address = self.socket.accept()
-                self.connected = True
-                logging.info('Client connected: %s' % self.address[0])
-                super(NMEATCPServer, self).loop()
+                super(NMEATCPConnection, self).loop()
             except socket.error:
                 if self.connected:
                     logging.info('Client %s disconnected' % self.address[0])
                     self.connected = False
                     self.client = None
                     self.address = None
-                else:
-                    logging.debug('Waiting for connection on port %s' % self.port)
-                    time.sleep(1)
+                    self.stop()
 
     def __str__(self):
-        if self.connected:
-            status_string = '%s:%s' % (self.address[0], self.port)
-        else:
-            status_string = 'waiting:%s' % self.port
-        return '%s (%s:%s)' % (self.__class__.__name__, status_string, self.port)
+        return '%s (%s)' % (self.__class__.__name__, self.address[0])
 
 
-def main_loop():
-    while 1:
-        time.sleep(0.01)
+def listen_on_port(port):
+        logging.info("Listening on port %s" % port)
+        backlog = 5
+
+        listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listen_socket.bind(('0.0.0.0', port))
+        listen_socket.setblocking(0)
+        listen_socket.settimeout(0)
+        listen_socket.listen(backlog)
+
+        while 1:
+            try:
+                client, address = listen_socket.accept()
+
+                handler = NMEATCPConnection(client, address)
+                handler_thread = StoppableThread(target=handler.loop)
+                handler_thread.daemon = True
+                handler_thread.start()
+                handler_threads.append(handler_thread)
+                handlers.append(handler)
+
+                logging.info('Client %s connected to port %s' % (address[0], port))
+
+            except socket.error:
+                time.sleep(0.5)
 
 
 def thread_cleanup(signal, frame):
@@ -181,6 +187,7 @@ def thread_cleanup(signal, frame):
     for thread in handler_threads:
         thread.stop()
         logging.info('Cleaning up thread: %s' % thread.name)
+
     sys.exit(0)
 
 
@@ -198,27 +205,18 @@ if __name__ == '__main__':
     parser.add_argument('--loglevel', help='Set log level to DEBUG, INFO, WARNING, or ERROR', default='INFO')
     parser.add_argument('--logfile', help='Log file to append to.',)
     parser.add_argument('--uart', help='File descriptor of UART to connect to proxy.', metavar="DEVICE[,BAUD]", action='append', default=[])
-    parser.add_argument('--tcp', help='Listening ports to open for proxy.', type=int, action='append', default=[])
+    parser.add_argument('--tcp', help='Listening ports to open for proxy.', type=int)
 
     args = parser.parse_args()
     log_level = args.loglevel
     log_file = args.logfile
     uart_devices = args.uart
-    tcp_ports = args.tcp
+    tcp_port = args.tcp
 
     numeric_log_level = getattr(logging, log_level.upper(), None)
     if not isinstance(numeric_log_level, int):
         raise ValueError('Invalid log level: %s' % log_level)
     logging.basicConfig(level=numeric_log_level, format='%(asctime)s %(levelname)s:%(message)s', filename=log_file)
-
-    for tcp_port in tcp_ports:
-        handler = NMEATCPServer(tcp_port)
-        handler_thread = StoppableThread(target=handler.loop)
-        handler_thread.daemon = True
-        handler_thread.start()
-        handler_threads.append(handler_thread)
-        handlers.append(handler)
-        logging.info("TCP server for port %d running in thread: %s" % (tcp_port, handler_thread.name))
 
     for uart_device in uart_devices:
         if ',' in uart_device:
@@ -234,4 +232,8 @@ if __name__ == '__main__':
         handlers.append(handler)
         logging.info("Serial handler for %s running in thread: %s" % (uart_device, handler_thread.name))
 
-    main_loop()
+    if tcp_port:
+        listen_on_port(tcp_port)
+    else:
+        while 1:
+            time.sleep(1)
