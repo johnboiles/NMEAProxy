@@ -16,7 +16,7 @@ case "$1" in
   start)
     echo "Starting nmea_proxy"
     # run application you want to start
-    /root/repos/NMEAProxy/NMEAProxy/nmea_proxy.py --tcp 2000 --uart /dev/ttyACM0 --loglevel INFO --logfile /var/log/nmea_proxy &
+    nmea_proxy.py --tcp 2000 --uart /dev/ttyACM0 --loglevel INFO --logfile /var/log/nmea_proxy &
     ;;
   stop)
     echo "Stopping nmea_proxy"
