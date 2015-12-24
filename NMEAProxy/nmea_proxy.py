@@ -152,8 +152,24 @@ class NMEATCPConnection(NMEAHandler):
         return '%s (%s)' % (self.__class__.__name__, self.address[0])
 
 
+class NMEAUDPConnection(NMEATCPConnection):
+    """Opens a UDP socket on the specified port for receiving NMEA Messages"""
+
+    def receive(self):
+        ready = select.select([self.client], [], [], 0)
+        if ready[0]:
+            received, addr = self.client.recvfrom(1024)
+            print("Received %s from %s" % (received, addr))
+            # The server will need to keep track of who is connected to it for itself
+            self.client.sendto("hi", addr)
+            return received
+
+    def __str__(self):
+        return '%s (%s)' % (self.__class__.__name__, self.address[0])
+
+
 def listen_on_port(port):
-        logging.info("Listening on port %s" % port)
+        logging.info("Listening on TCP port %s" % port)
         backlog = 5
 
         listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -174,7 +190,7 @@ def listen_on_port(port):
                 handler_threads.append(handler_thread)
                 handlers.append(handler)
 
-                logging.info('Client %s connected to port %s' % (address[0], port))
+                logging.info('Client %s connected to port %s (TCP)' % (address[0], port))
 
             except socket.error:
                 time.sleep(0.5)
@@ -205,18 +221,33 @@ if __name__ == '__main__':
     parser.add_argument('--loglevel', help='Set log level to DEBUG, INFO, WARNING, or ERROR', default='INFO')
     parser.add_argument('--logfile', help='Log file to append to.',)
     parser.add_argument('--uart', help='File descriptor of UART to connect to proxy.', metavar="DEVICE[,BAUD]", action='append', default=[])
-    parser.add_argument('--tcp', help='Listening ports to open for proxy.', type=int)
+    parser.add_argument('--tcp', help='Listening TCP ports to open for proxy.', type=int)
+    parser.add_argument('--udp', help='Listening UDP ports to open for proxy.', type=int)
 
     args = parser.parse_args()
     log_level = args.loglevel
     log_file = args.logfile
     uart_devices = args.uart
     tcp_port = args.tcp
+    udp_port = args.udp
 
     numeric_log_level = getattr(logging, log_level.upper(), None)
     if not isinstance(numeric_log_level, int):
         raise ValueError('Invalid log level: %s' % log_level)
     logging.basicConfig(level=numeric_log_level, format='%(asctime)s %(levelname)s:%(message)s', filename=log_file)
+
+    if udp_port:
+        logging.info("Listening on UDP port %s" % udp_port)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # UDP
+        sock.bind(('0.0.0.0', udp_port))
+
+        handler = NMEAUDPConnection(sock, "fake fake")
+        handler_thread = StoppableThread(target=handler.loop)
+        handler_thread.daemon = True
+        handler_thread.start()
+        handler_threads.append(handler_thread)
+        handlers.append(handler)
 
     for uart_device in uart_devices:
         if ',' in uart_device:
@@ -233,7 +264,11 @@ if __name__ == '__main__':
         logging.info("Serial handler for %s running in thread: %s" % (uart_device, handler_thread.name))
 
     if tcp_port:
-        listen_on_port(tcp_port)
-    else:
-        while 1:
-            time.sleep(1)
+        handler_thread = StoppableThread(target=listen_on_port, args=[tcp_port])
+        handler_thread.daemon = True
+        handler_thread.start()
+        handler_threads.append(handler_thread)
+        handlers.append(handler)
+
+    while 1:
+        time.sleep(1)
