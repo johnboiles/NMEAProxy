@@ -1,0 +1,11 @@
+[Unit]
+Description=NMEA Proxy
+
+[Service]
+# Uncomment to have systemd automatically restart this process if it fails
+#Restart=always
+WorkingDirectory=/home/pi/repos/NMEAProxy
+ExecStart=/home/pi/repos/NMEAProxy/NMEAProxy/nmea_proxy.py --tcp 2000 --uart /dev/ttyACM0 --loglevel INFO --logfile /var/log/nmea_proxy
+
+[Install]
+WantedBy=default.target
